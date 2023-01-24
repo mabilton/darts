@@ -35,6 +35,7 @@ def create_lagged_data(
     use_moving_windows: bool = True,
     is_training: bool = True,
     concatenate: bool = True,
+    add_static_covariates: bool = True,
 ) -> Tuple[ArrayOrArraySequence, Union[None, ArrayOrArraySequence], Sequence[pd.Index]]:
     """
     Creates the features array `X` and labels array `y` to train a lagged-variables regression model (e.g. an
@@ -247,10 +248,15 @@ def create_lagged_data(
         len(seq_ts_lens) > 1,
         "Must specify the same number of `TimeSeries` for each series input.",
     )
+    num_ts = max(seq_ts_lens)
+    if add_static_covariates:
+        static_covariates = _collect_static_covariates(
+            num_ts, target_series, past_covariates, future_covariates
+        )
     if max_samples_per_ts is None:
         max_samples_per_ts = inf
     X, y, times = [], [], []
-    for i in range(max(seq_ts_lens)):
+    for i in range(num_ts):
         target_i = target_series[i] if target_series else None
         past_i = past_covariates[i] if past_covariates else None
         future_i = future_covariates[i] if future_covariates else None
@@ -282,6 +288,8 @@ def create_lagged_data(
                 check_inputs,
                 is_training,
             )
+        if add_static_covariates:
+            X_i = _add_static_covariates(X_i, static_covariates[i])
         X.append(X_i)
         y.append(y_i)
         times.append(times_i)
@@ -293,6 +301,31 @@ def create_lagged_data(
     elif concatenate:
         y = np.concatenate(y, axis=0)
     return X, y, times
+
+
+def _collect_static_covariates(
+    num_ts, target_series, past_covariates, future_covariates, check_inputs
+):
+    static_covariates = []
+    for i in range(num_ts):
+        scovs_i = []
+        for series in (target_series, past_covariates, future_covariates):
+            if series and series[i].has_static_covariates:
+                scovs_i.append(list(series[i].static_covariates.values()))
+        scovs_i = np.concatenate(scovs_i, axis=0)
+        static_covariates.append(scovs_i)
+    if check_inputs:
+        scov_lens = {len(scov_i) for scov_i in static_covariates}
+        raise_if(len(scov_lens) > 1, "")
+    return static_covariates
+
+
+def _add_static_covariates(X_block, scov_values):
+    num_obs = X_block.shape[0]
+    num_scov = scov_values.size
+    scov_block = np.broadcast_to((num_obs, num_scov), scov_values)
+    X_block = np.concatenate([X_block, scov_block], axis=1)
+    return X_block
 
 
 def create_lagged_training_data(
