@@ -30,6 +30,7 @@ def create_lagged_data(
     lags_future_covariates: Optional[Sequence[int]] = None,
     output_chunk_length: int = 1,
     max_samples_per_ts: Optional[int] = None,
+    timestamps: Optional[Union[pd.Index, Sequence[pd.Index]]] = None,
     multi_models: bool = True,
     check_inputs: bool = True,
     use_moving_windows: bool = True,
@@ -238,20 +239,30 @@ def create_lagged_data(
     target_series = series2seq(target_series)
     past_covariates = series2seq(past_covariates)
     future_covariates = series2seq(future_covariates)
+    timestamps = [timestamps] if isinstance(timestamps, pd.Index) else timestamps
     seq_ts_lens = [
         len(seq_ts)
         for seq_ts in (target_series, past_covariates, future_covariates)
         if seq_ts is not None
     ]
     seq_ts_lens = set(seq_ts_lens)
-    raise_if(
-        len(seq_ts_lens) > 1,
-        "Must specify the same number of `TimeSeries` for each series input.",
-    )
     num_ts = max(seq_ts_lens)
+    if check_inputs:
+        raise_if(
+            len(seq_ts_lens) > 1,
+            "Must specify the same number of `TimeSeries` for each series input.",
+        )
+        raise_if(
+            (timestamps is not None)
+            and len(timestamps) > 1
+            and len(timestamps) != num_ts,
+            "Must specify either a single . or one for each.",
+        )
+    if timestamps is not None:
+        timestamps = num_ts * timestamps
     if add_static_covariates:
         static_covariates = _collect_static_covariates(
-            num_ts, target_series, past_covariates, future_covariates
+            num_ts, target_series, past_covariates, future_covariates, check_inputs
         )
     if max_samples_per_ts is None:
         max_samples_per_ts = inf
@@ -270,6 +281,7 @@ def create_lagged_data(
                 lags_past_covariates,
                 lags_future_covariates,
                 max_samples_per_ts,
+                timestamps[i] if timestamps else None,
                 multi_models,
                 check_inputs,
                 is_training,
@@ -284,6 +296,7 @@ def create_lagged_data(
                 lags_past_covariates,
                 lags_future_covariates,
                 max_samples_per_ts,
+                timestamps[i] if timestamps else None,
                 multi_models,
                 check_inputs,
                 is_training,
@@ -311,9 +324,8 @@ def _collect_static_covariates(
         scovs_i = []
         for series in (target_series, past_covariates, future_covariates):
             if series and series[i].has_static_covariates:
-                scovs_i.append(list(series[i].static_covariates.values()))
-        scovs_i = np.concatenate(scovs_i, axis=0)
-        static_covariates.append(scovs_i)
+                scovs_i.extend(list(series[i].static_covariates.values.T.flatten()))
+        static_covariates.append(np.array(scovs_i))
     if check_inputs:
         scov_lens = {len(scov_i) for scov_i in static_covariates}
         raise_if(len(scov_lens) > 1, "")
@@ -322,8 +334,11 @@ def _collect_static_covariates(
 
 def _add_static_covariates(X_block, scov_values):
     num_obs = X_block.shape[0]
+    num_samples = X_block.shape[2]
     num_scov = scov_values.size
-    scov_block = np.broadcast_to((num_obs, num_scov), scov_values)
+    scov_block = np.broadcast_to(
+        scov_values.reshape(-1, 1), (num_obs, num_scov, num_samples)
+    )
     X_block = np.concatenate([X_block, scov_block], axis=1)
     return X_block
 
@@ -341,6 +356,7 @@ def create_lagged_training_data(
     check_inputs: bool = True,
     use_moving_windows: bool = True,
     concatenate: bool = True,
+    add_static_covariates: bool = True,
 ) -> Tuple[ArrayOrArraySequence, Union[None, ArrayOrArraySequence], Sequence[pd.Index]]:
     """
     Creates the features array `X` and labels array `y` to train a lagged-variables regression model (e.g. an
@@ -449,6 +465,7 @@ def create_lagged_training_data(
         use_moving_windows=use_moving_windows,
         is_training=True,
         concatenate=concatenate,
+        add_static_covariates=add_static_covariates,
     )
 
 
@@ -463,6 +480,7 @@ def create_lagged_prediction_data(
     check_inputs: bool = True,
     use_moving_windows: bool = True,
     concatenate: bool = True,
+    add_static_covariates: bool = True,
 ) -> Tuple[ArrayOrArraySequence, Union[None, ArrayOrArraySequence], Sequence[pd.Index]]:
     """
     Creates the features array `X` to produce a series of prediction from an already-trained regression model; the
@@ -556,6 +574,7 @@ def create_lagged_prediction_data(
         use_moving_windows=use_moving_windows,
         is_training=False,
         concatenate=concatenate,
+        add_static_covariates=add_static_covariates,
     )
     return X, times
 
@@ -569,6 +588,7 @@ def _create_lagged_data_by_moving_window(
     lags_past_covariates: Optional[Sequence[int]],
     lags_future_covariates: Optional[Sequence[int]],
     max_samples_per_ts: Optional[int],
+    timestamps: Optional[pd.Index],
     multi_models: bool,
     check_inputs: bool,
     is_training: bool,
@@ -748,6 +768,7 @@ def _create_lagged_data_by_intersecting_times(
     lags_past_covariates: Optional[Sequence[int]],
     lags_future_covariates: Optional[Sequence[int]],
     max_samples_per_ts: Optional[int],
+    timestamps: Optional[pd.Index],
     multi_models: bool,
     check_inputs: bool,
     is_training: bool,
@@ -784,6 +805,8 @@ def _create_lagged_data_by_intersecting_times(
         shared_times is None,
         "Specified series do not share any common times for which features can be created.",
     )
+    if timestamps:
+        shared_times = get_shared_times(shared_times, timestamps, sort=True)
     if len(shared_times) > max_samples_per_ts:
         shared_times = shared_times[-max_samples_per_ts:]
     X = []

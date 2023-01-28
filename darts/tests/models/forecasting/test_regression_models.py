@@ -702,6 +702,7 @@ class RegressionModelsTestCase(DartsBaseTestClass):
                 target_lag,
                 past_covs_lag if past_covs else None,
                 future_covs_lag if future_covs else None,
+                add_static_covariates=False,
             )
             # Remove redundant sample dimension:
             X_i = X_i[:, :, 0]

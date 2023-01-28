@@ -31,12 +31,16 @@ from collections import OrderedDict
 from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
+import pandas as pd
 from sklearn.linear_model import LinearRegression
 
 from darts.logging import get_logger, raise_if, raise_if_not, raise_log
 from darts.models.forecasting.forecasting_model import GlobalForecastingModel
 from darts.timeseries import TimeSeries
-from darts.utils.data.tabularization import create_lagged_training_data
+from darts.utils.data.tabularization import (
+    create_lagged_prediction_data,
+    create_lagged_training_data,
+)
 from darts.utils.multioutput import MultiOutputRegressor
 from darts.utils.utils import _check_quantiles, seq2series, series2seq
 
@@ -317,7 +321,7 @@ class RegressionModel(GlobalForecastingModel):
 
         return last_valid_pred_time
 
-    def _create_lagged_data(
+    def _create_lagged_training_data(
         self, target_series, past_covariates, future_covariates, max_samples_per_ts
     ):
         lags = self.lags.get("target")
@@ -346,6 +350,44 @@ class RegressionModel(GlobalForecastingModel):
 
         return training_samples, training_labels
 
+    def _create_lagged_prediction_data(
+        self, target_series, past_covariates, future_covariates, max_samples_per_ts
+    ):
+        lags = self.lags.get("target")
+        lags_past_covariates = self.lags.get("past")
+        lags_future_covariates = self.lags.get("future")
+
+        target_series, past_covariates, future_covariates = self._add_static_covariates(
+            target_series, past_covariates, future_covariates
+        )
+
+        training_samples, _ = create_lagged_prediction_data(
+            target_series=target_series,
+            past_covariates=past_covariates,
+            future_covariates=future_covariates,
+            lags=lags,
+            lags_past_covariates=lags_past_covariates,
+            lags_future_covariates=lags_future_covariates,
+            max_samples_per_ts=max_samples_per_ts,
+            check_inputs=False,
+        )
+
+        training_samples = training_samples[:, :, 0]
+
+        # If static covs used for training but not provided when predicting,
+        # pad zero columns onto end of array:
+        missing_scov = (
+            hasattr(self.model, "n_features_in_")
+            and (self.model.n_features_in_ is not None)
+            and self.model.n_features_in_ > training_samples.shape[1]
+        )
+        if missing_scov:
+            pad_len = self.model.n_features_in_ - training_samples.shape[1]
+            zero_padding = np.zeros((training_samples.shape[0], pad_len))
+            training_samples = np.concatenate([training_samples, zero_padding], axis=1)
+
+        return training_samples
+
     def _add_static_covariates(
         self,
         target_series: Sequence[TimeSeries],
@@ -364,6 +406,7 @@ class RegressionModel(GlobalForecastingModel):
                 "`future_covariates` do not contain the same number of `TimeSeries`."
             ),
         )
+        num_ts = max(num_ts)
         ts_names = ["target_series", "past_covariates", "future_covariates"]
         # Check static covs exist + collect sizes of static covs for each series input:
         scov_sizes = {ts_name: {} for ts_name in ts_names}
@@ -372,11 +415,11 @@ class RegressionModel(GlobalForecastingModel):
             for ts_name, ts_list in zip(
                 ts_names, [target_series, past_covariates, future_covariates]
             ):
-                if ts_list and ts_list[i].has_static_covariates():
+                if ts_list and ts_list[i].has_static_covariates:
                     static_covs_exist = True
-                    for scov_name, scov_val in ts_list[i].static_covariates():
+                    for scov_name, scov_val in ts_list[i].static_covariates.items():
                         if scov_name in scov_sizes[ts_name]:
-                            expected_size = scov_sizes[ts_name]
+                            expected_size = scov_sizes[ts_name][scov_name]
                             actual_size = scov_val.size
                             raise_if_not(
                                 expected_size == actual_size,
@@ -395,14 +438,14 @@ class RegressionModel(GlobalForecastingModel):
             ):
                 if ts_list:
                     scovs = {}
-                    for scov_name, scov_size in scov_sizes.items():
-                        if ts_list[i].has_static_covariates() and (
+                    for scov_name, scov_size in scov_sizes[ts_name].items():
+                        if ts_list[i].has_static_covariates and (
                             scov_name in ts_list[i].static_covariates
                         ):
                             scovs[scov_name] = ts_list[i].static_covariates[scov_name]
                         else:
                             scovs[scov_name] = scov_size * [0]
-                    ts_list[i] = ts_list[i].with_static_covariates(scovs)
+                    ts_list[i] = ts_list[i].with_static_covariates(pd.DataFrame(scovs))
         return target_series, past_covariates, future_covariates
 
     def _fit_model(
@@ -418,7 +461,7 @@ class RegressionModel(GlobalForecastingModel):
         adding validation data), keeping the sanity checks on series performed by fit().
         """
 
-        training_samples, training_labels = self._create_lagged_data(
+        training_samples, training_labels = self._create_lagged_training_data(
             target_series,
             past_covariates,
             future_covariates,
@@ -745,17 +788,6 @@ class RegressionModel(GlobalForecastingModel):
 
             # concatenate retrieved lags
             X = np.concatenate(np_X, axis=1)
-            # If static covs used for training but cot provided when predicting,
-            # pad zero columns onto end of array:
-            missing_scov = (
-                hasattr(self.model, "n_features_in_")
-                and (self.model.n_features_in_ is not None)
-                and self.model.n_features_in_ > X.shape[1]
-            )
-            if missing_scov:
-                pad_len = self.model.n_features_in_ - X.shape[1]
-                zero_padding = np.zeros((X.shape[0], pad_len))
-                X = np.concatenate([X, zero_padding], axis=1)
 
             # X has shape (n_series * n_samples, n_regression_features)
             prediction = self._predict_and_sample(X, num_samples, **kwargs)
